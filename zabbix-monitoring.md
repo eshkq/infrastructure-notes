@@ -323,6 +323,122 @@ Enabling Override is important — without it each item uses the retention perio
 
 ---
 
+## How It Works Under the Hood
+
+### Active vs Passive mode
+
+Two agent modes — the key difference is who initiates the connection.
+
+**Passive mode:**
+```
+Server/Proxy ──► connect to agent :10050 ──► pull metrics
+```
+Server connects to the agent and pulls data. Requires port `10050` open and reachable on every monitored node.
+
+**Active mode:**
+```
+Agent ──► connect to Proxy :10051 ──► push metrics
+```
+Agent connects to Proxy, fetches the list of checks, executes them, and pushes results. No inbound port needed on the node.
+
+Active mode is the only practical choice in a distributed setup: nodes may be behind NAT, firewalls, or in different networks. An agent can always make an outbound TCP connection — but reaching the agent from outside is not always possible.
+
+### Data flow and the role of Proxy
+
+```
+agent (any node)
+    │
+    └──► Proxy (mesh hub)         ← all agents push here
+              │
+              │  buffers data locally (SQLite)
+              │  if Server is unreachable — stores data, flushes on reconnect
+              │
+              └──► Server (main VPS)
+                        │
+                        └──► PostgreSQL
+                                  │
+                                  └──► Web UI
+```
+
+**Why route all agents through Proxy even if some nodes can reach Server directly:**
+- Uniformity — all agents have identical config regardless of location
+- Server has no knowledge of agent topology — adding a new node requires no changes on Server
+- Buffering works for all nodes: if Server restarts or is briefly unreachable, Proxy holds the data
+
+### Why Docker won't bind ports to a mesh interface
+
+`internal: true` on a Docker network means the container has no route to the host's external interfaces. Docker physically cannot expose a port from such a container on a host IP — there is no network path.
+
+```
+Problem (didn't work):
+container ──► internal network (internal: true) ──► ✗ no path to mesh interface
+
+Solution (works):
+container ──► zabbix-internal (internal: true)   ← postgres stays isolated
+         └──► zabbix-external (bridge)            ← path to host interfaces exists
+                    │
+                    └──► bind port on mesh IP ✓
+```
+
+postgres stays in `zabbix-internal` only — it never touches the outside world.
+
+### Zabbix reacts to events, not states
+
+This is critical to understand when setting up alerts.
+
+**Event** = the moment a trigger transitions between states:
+- OK → PROBLEM = new event, action fires, notification sent
+- PROBLEM persists without change = no new events, no notifications
+
+If a trigger was already in PROBLEM state when you created an action — no notification will be sent. Actions only subscribe to events from the moment of creation, not to current state.
+
+**How to test an alert after setting up actions:**
+Change a threshold macro so the trigger resolves (PROBLEM → OK), then change it back (OK → PROBLEM) — two new events, both generate notifications.
+
+### Why web-monitoring runs on a separate host via Proxy
+
+If a web scenario lives on the same host as the service, they go down together:
+
+```
+home-server goes down:
+├── agent goes silent   → alert "host unavailable"
+└── web scenario stops  → no HTTP check, no service alert
+```
+
+An independent proxy node as the observation point separates two different failure scenarios:
+
+```
+home-server alive, service crashed:
+├── agent works         → host Available
+└── Proxy makes HTTP    → gets 502 → alert "service is unavailable"
+
+home-server goes down:
+├── agent silent        → alert "host unavailable"
+└── Proxy makes HTTP    → timeout → alert "service is unavailable"
+```
+
+Two different alerts with different meanings — one says "look at the server", the other says "look at the container".
+
+### Override in Housekeeping
+
+Without Override, each item retains data according to its template definition — different items have different retention periods, making PostgreSQL growth unpredictable.
+
+```
+Without Override:
+item A (Linux template)  → 90 days
+item B (Web template)    → 30 days
+item C (custom)          → 365 days
+→ PostgreSQL grows unpredictably
+
+With Override (30d History):
+all items                → 30 days, no exceptions
+→ PostgreSQL grows predictably
+```
+
+Trends use a separate, longer retention (e.g. 365d) because they are much lighter than raw history — aggregated min/max/avg per hour instead of every data point. A year of trends gives you seasonality patterns useful for capacity planning.
+
+---
+
 ## Common Issues
 
 **Container port not binding to mesh IP:**
