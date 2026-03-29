@@ -23,6 +23,7 @@ Currently working as a Systems Analyst at a software company, acting as the de f
 | Document | Description |
 |---|---|
 | [restic-backup.md](./restic-backup.md) | Encrypted backups to S3-compatible storage with restic — PostgreSQL via stdin pipe + Docker volume directory |
+| [zabbix-monitoring.md](./zabbix-monitoring.md) | Zabbix 7.0 LTS monitoring over WireGuard mesh — Server + Proxy + Agents + Telegram alerts |
 
 More coming as I build and document things.
 
