@@ -7,13 +7,21 @@ A practical guide to setting up encrypted, deduplicated backups with restic and 
 ## Architecture Overview
 
 ```
-VPS — PostgreSQL (Docker)
+VPS — PostgreSQL (Docker) — two databases
 └── cron → backup.sh (host)
-      ├── docker exec postgres-db pg_dump
+      ├── docker exec postgres-db pg_dump (app db)
       │         |
       │        pipe (on host)
       │         |
-      └── docker run restic/restic backup --stdin → S3
+      │   docker run restic/restic backup --stdin (postgres.sql)
+      │
+      ├── docker exec zabbix-postgres pg_dump (zabbix)
+      │         |
+      │        pipe (on host)
+      │         |
+      │   docker run restic/restic backup --stdin (zabbix.sql)
+      │
+      └── → S3
 
 Home Server — Vaultwarden (VM)
 └── cron → backup.sh (host)
@@ -88,6 +96,18 @@ docker exec postgres-db pg_dump -U postgres postgres \
         --cache-dir /cache \
         --tag postgres
 
+# Zabbix PostgreSQL
+docker exec zabbix-postgres pg_dump -U zabbix zabbix \
+  | docker run --rm -i \
+      --dns 1.1.1.1 \
+      --env-file /opt/restic/.env \
+      -v restic-cache:/cache \
+      restic/restic backup \
+        --stdin \
+        --stdin-filename zabbix.sql \
+        --cache-dir /cache \
+        --tag zabbix,postgres
+
 echo "[$(date)] Pruning old snapshots..."
 
 docker run --rm \
@@ -106,7 +126,7 @@ echo "[$(date)] Done."
 curl -s --max-time 10 \
   "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
   -d chat_id="${TG_CHAT}" \
-  -d text="✅ Postgres backup done — $(date '+%Y-%m-%d %H:%M')" \
+  -d text="✅ VPS backup done (postgres + zabbix) — $(date '+%Y-%m-%d %H:%M')" \
   > /dev/null || echo "[$(date)] Telegram notification failed, skipping"
 ```
 
@@ -261,12 +281,21 @@ Output:
 ID        Time                 Host        Tags         Paths   Size
 ----------------------------------------------------------------------
 211a4a6a  2026-03-28 14:14:45  homeserver  vaultwarden  /data   3.468 MiB
-f85a0f8c  2026-03-29 03:00:28  homeserver  vaultwarden  /data   512 KiB
+4fe8cf48  2026-03-29 03:30:02  homeserver  vaultwarden  /data   3.468 MiB
+94f0d16e  2026-03-30 03:30:01  homeserver  vaultwarden  /data   3.617 MiB
 ```
 
 - **ID** — unique snapshot identifier, first 8 chars are enough
-- **Size** — only the new data added in this snapshot, not total volume
+- **Size** — total size of data at the time of the snapshot, not the actual space used in S3. Real storage usage is much lower due to deduplication and compression
 - `latest` — alias for the most recent snapshot
+
+To see the actual size on disk in S3:
+
+```bash
+docker run --rm --dns 1.1.1.1 \
+  --env-file /opt/restic/.env \
+  restic/restic stats --mode raw-data
+```
 
 ### Browse snapshot contents without restoring
 
@@ -339,7 +368,19 @@ docker run --rm --dns 1.1.1.1 \
   | docker exec -i postgres-db psql -U postgres postgres
 ```
 
-### Partial restore — single file or directory
+### Restore — Zabbix PostgreSQL
+
+Same approach as the main PostgreSQL restore.
+
+```bash
+docker run --rm --dns 1.1.1.1 \
+  --env-file /opt/restic/.env \
+  restic/restic dump latest /zabbix.sql > /tmp/zabbix_restore.sql
+
+docker compose stop zabbix-server
+docker exec -i zabbix-postgres psql -U zabbix zabbix < /tmp/zabbix_restore.sql
+docker compose start zabbix-server
+```
 
 ```bash
 docker run --rm --dns 1.1.1.1 \
