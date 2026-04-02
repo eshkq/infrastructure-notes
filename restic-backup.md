@@ -58,6 +58,8 @@ AWS_ACCESS_KEY_ID=YOUR_KEY
 AWS_SECRET_ACCESS_KEY=YOUR_SECRET
 RESTIC_REPOSITORY=s3:s3.your-provider.com/YOUR_BUCKET/vps-postgres
 RESTIC_PASSWORD=YOUR_STRONG_PASSWORD
+TG_BOT=YOUR_BOT_TOKEN
+TG_CHAT=YOUR_CHAT_ID
 ```
 
 ```bash
@@ -69,6 +71,8 @@ chmod 600 /opt/restic/.env
 ```bash
 #!/bin/bash
 set -euo pipefail
+
+source /opt/restic/.env
 
 echo "[$(date)] Starting backup..."
 
@@ -97,6 +101,13 @@ docker run --rm \
     --keep-monthly 3
 
 echo "[$(date)] Done."
+
+# Telegram notification — VPS has direct access to Telegram API
+curl -s --max-time 10 \
+  "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
+  -d chat_id="${TG_CHAT}" \
+  -d text="✅ Postgres backup done — $(date '+%Y-%m-%d %H:%M')" \
+  > /dev/null || echo "[$(date)] Telegram notification failed, skipping"
 ```
 
 ```bash
@@ -137,6 +148,10 @@ AWS_ACCESS_KEY_ID=YOUR_KEY
 AWS_SECRET_ACCESS_KEY=YOUR_SECRET
 RESTIC_REPOSITORY=s3:s3.your-provider.com/YOUR_BUCKET/home-vaultwarden
 RESTIC_PASSWORD=YOUR_DIFFERENT_STRONG_PASSWORD
+TG_BOT=YOUR_BOT_TOKEN
+TG_CHAT=YOUR_CHAT_ID
+# Optional: SOCKS5 proxy if Telegram API is blocked in your region
+SOCKS5_PROXY=your-proxy-host:port
 ```
 
 ```bash
@@ -148,6 +163,8 @@ chmod 600 /opt/restic/.env
 ```bash
 #!/bin/bash
 set -euo pipefail
+
+source /opt/restic/.env
 
 echo "[$(date)] Starting backup..."
 
@@ -175,6 +192,15 @@ docker run --rm \
     --keep-monthly 3
 
 echo "[$(date)] Done."
+
+# Telegram notification
+# If Telegram API is blocked, route through a SOCKS5 proxy:
+# curl -s --max-time 10 --socks5-hostname "${SOCKS5_PROXY}" \
+curl -s --max-time 10 \
+  "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
+  -d chat_id="${TG_CHAT}" \
+  -d text="✅ Vaultwarden backup done — $(date '+%Y-%m-%d %H:%M')" \
+  > /dev/null || echo "[$(date)] Telegram notification failed, skipping"
 ```
 
 ```bash
@@ -544,48 +570,26 @@ Current setup: data on server + backup in S3 = **2-1-1**. Good enough for a home
 
 ## Backup Monitoring
 
-### The gap
+### Current setup
 
-There are no alerts if a backup fails. Cron fires, script crashes, you find out only when you check the log manually. You could go weeks without working backups and not know it.
-
-### Two levels of monitoring
-
-**Heartbeat** — after a successful backup, the script pings an external URL. If no ping arrives within N hours, an alert fires. Catches cases where cron didn't run at all or the script crashed.
-
-**Result notification** — script sends a message (e.g. Telegram) with snapshot details after each successful run. Gives confidence that things are working.
-
-Best to combine both:
+Telegram notifications are configured on both servers. After each successful backup, a message is sent. If the script crashes — `set -euo pipefail` exits before reaching the curl call, so no notification arrives, which itself signals something went wrong.
 
 ```
-backup succeeds → curl healthchecks.io     (I'm alive)
-               → telegram "✅ snapshot abc123, 3.7MB, 14s"
-
-backup fails   → script exits (set -euo pipefail)
-               → healthchecks.io gets no ping
-               → healthchecks.io fires alert "backup missed"
+backup succeeds → telegram "✅ Vaultwarden backup done — 2026-04-02 03:30"
+backup fails    → script exits early → no notification → you notice the silence
 ```
 
-### How to add it (when ready)
-
-Append to the end of `backup.sh`:
+If Telegram API is blocked in your region (e.g. Russia), route the curl through a SOCKS5 proxy:
 
 ```bash
-# heartbeat — signal that backup completed successfully
-curl -fsS https://hc-ping.com/YOUR-UUID > /dev/null
-
-# telegram notification with snapshot ID
-SNAPSHOT_ID=$(docker run --rm --dns 1.1.1.1 \
-  --env-file /opt/restic/.env \
-  restic/restic snapshots --last --json | jq -r '.[0].short_id')
-
-curl -s "https://api.telegram.org/botTOKEN/sendMessage" \
-  -d chat_id="CHAT_ID" \
-  -d text="✅ Backup done: $SNAPSHOT_ID"
+curl -s --max-time 10 --socks5-hostname your-proxy:port \
+  "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
+  ...
 ```
 
-[healthchecks.io](https://healthchecks.io) has a free tier and is also available as a self-hosted option.
+`--max-time 10` ensures the script doesn't hang if the proxy is unreachable.
 
-### Manual check (until automation is in place)
+### Manual check
 
 ```bash
 # check that snapshots exist and are recent
@@ -594,6 +598,16 @@ docker run --rm --dns 1.1.1.1 --env-file /opt/restic/.env restic/restic snapshot
 # check last run log
 tail -50 /var/log/restic-backup.log
 ```
+
+### Next step — healthchecks.io
+
+Telegram notifies on success but doesn't actively alert on failure. For complete coverage, add a heartbeat via [healthchecks.io](https://healthchecks.io) — if no ping arrives within N hours, an alert fires:
+
+```bash
+curl -fsS https://hc-ping.com/YOUR-UUID > /dev/null
+```
+
+Free tier available, self-hosted option exists.
 
 ---
 
